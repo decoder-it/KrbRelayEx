@@ -56,6 +56,7 @@ Building upon the concept, I started from the great [KrbRelay](https://github.co
 
 - **Servers that enforce SMB signing**:  
   By default a relayed AP-REQ cannot be used against a server that requires SMB signing, because the relayed client never negotiated a session key we know. With `-reauth <DOMAIN/user:password>`, KrbRelayEx first opens a base SMB session with a low privileged account of your choice (deriving its signing key), and then sends the reflected AP-REQ as a **re-authentication on that same session**. The server accepts the identity switch but keeps signing with the key we already hold, so the privileged session remains usable. See the dedicated example below. https://blackfield.ch/blog/defeating-enforced-smb-signing/
+  ![image](SMGSIGN.png)
 
 
 ## Blog
