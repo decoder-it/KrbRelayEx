@@ -36,7 +36,7 @@ Building upon the concept, I started from the great [KrbRelay](https://github.co
 - Interactive or background **multithreaded SMB consoles** for managing multiple connections, enabling file manipulation and the creation/startup of services.  
 - **Multithreaded port forwarding** to forward additional traffic from clients to original destination such as RDP, HTTP(S), RPC Mapper, WinRM,...
 - Transparent relaying process for **seamless user access**.  
-- Cross-platform compatibility with Windows and GNU/Linux via .NET 8.0 SDK.  
+- Cross-platform compatibility with Windows and GNU/Linux via .NET 10.0 SDK.  
 
 ---
 
@@ -56,7 +56,7 @@ Building upon the concept, I started from the great [KrbRelay](https://github.co
 
 - **Servers that enforce SMB signing**:  
   By default a relayed AP-REQ cannot be used against a server that requires SMB signing, because the relayed client never negotiated a session key we know. With `-reauth <DOMAIN/user:password>`, KrbRelayEx first opens a base SMB session with a low privileged account of your choice (deriving its signing key), and then sends the reflected AP-REQ as a **re-authentication on that same session**. The server accepts the identity switch but keeps signing with the key we already hold, so the privileged session remains usable. See the dedicated example below. https://blackfield.ch/blog/defeating-enforced-smb-signing/
-  ![image](SMGSIGN.png)
+  ![image](https://github.com/decoder-it/KrbRelayEx/SMGSIGN.png)
 
 
 ## Blog
